@@ -18,12 +18,32 @@ let default_headers =
   H2.Headers.of_list
     [ ("te", "trailers"); ("content-type", "application/grpc+proto") ]
 
+let status_of_headers headers =
+  match H2.Headers.get headers "grpc-status" with
+  | Some s -> (
+      let code =
+        match int_of_string_opt s with
+        | None -> None
+        | Some i -> Grpc.Status.code_of_int i
+      in
+      match code with
+      | None -> None
+      | Some code ->
+          let message = H2.Headers.get headers "grpc-message" in
+          let status = Grpc.Status.v ?message code in
+          Some status)
+  | None -> None
+
+let extract_status status_notify headers =
+  Option.iter (Lwt.wakeup_later status_notify) (status_of_headers headers)
+
 let call ~service ~rpc ?(scheme = "https") ~handler ~do_request
     ?(headers = default_headers) () =
   let request = make_request ~service ~rpc ~scheme ~headers in
   let read_body, read_body_notify = Lwt.wait () in
   let handler_res, handler_res_notify = Lwt.wait () in
   let out, out_notify = Lwt.wait () in
+  let status, status_notify = Lwt.wait () in
   let response_handler (response : H2.Response.t) body =
     Lwt.wakeup_later read_body_notify body;
     Lwt.async (fun () ->
@@ -32,26 +52,11 @@ let call ~service ~rpc ?(scheme = "https") ~handler ~do_request
             (Error (Grpc.Status.v Grpc.Status.Unknown));
           Lwt.return_unit)
         else
+          let () = extract_status status_notify response.headers in
           let+ handler_res in
           Lwt.wakeup_later out_notify (Ok handler_res))
   in
-  let status, status_notify = Lwt.wait () in
-  let trailers_handler headers =
-    let code =
-      match H2.Headers.get headers "grpc-status" with
-      | None -> None
-      | Some s -> (
-          match int_of_string_opt s with
-          | None -> None
-          | Some i -> Grpc.Status.code_of_int i)
-    in
-    match code with
-    | None -> ()
-    | Some code ->
-        let message = H2.Headers.get headers "grpc-message" in
-        let status = Grpc.Status.v ?message code in
-        Lwt.wakeup_later status_notify status
-  in
+  let trailers_handler = extract_status status_notify in
   let write_body =
     do_request ?trailers_handler:(Some trailers_handler) request
       ~response_handler
@@ -60,7 +65,11 @@ let call ~service ~rpc ?(scheme = "https") ~handler ~do_request
       let+ handler_res = handler write_body read_body in
       Lwt.wakeup_later handler_res_notify handler_res);
   let* out in
-  let+ status in
+  let+ status =
+    if Lwt.is_sleeping status then
+      Lwt.return (Grpc.Status.v Grpc.Status.Unknown)
+    else status
+  in
   match out with Error _ as e -> e | Ok out -> Ok (out, status)
 
 module Rpc = struct
